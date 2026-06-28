@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<title>Restorer — MTL Reader</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,500;8..60,600;8..60,700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.development.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.development.js"></script>
+<style>
+  :root{
+    --ink: #1A1612;
+    --ink-2: #221D18;
+    --paper: #F0E6D2;
+    --paper-dim: #C9BFA8;
+    --gold: #C9A876;
+    --brown: #5B4636;
+    --brown-light: #6E5644;
+    --stamp: #8B3A3A;
+    --stamp-dim: #A85C5C;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;}
+  body{
+    background: var(--ink);
+    color: var(--paper);
+    font-family: 'Inter', sans-serif;
+    -webkit-font-smoothing: antialiased;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+  #root{min-height:100vh;}
+  ::selection{ background: var(--gold); color: var(--ink); }
+
+  @media (prefers-reduced-motion: reduce){
+    *{ animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+  }
+
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes shimmer {
+    0% { background-position: -200% 0; }
+    100% { background-position: 200% 0; }
+  }
+
+  textarea, input { font-size: 13.5px; }
+  textarea:focus, input:focus { border-color: var(--gold) !important; }
+</style>
+</head>
+<body>
+<div id="root">Loading…</div>
+
+<script>
+  window.onerror = function(msg, url, line, col, error) {
+    var root = document.getElementById("root");
+    if (root) {
+      root.innerHTML = "<div style='color:#ff8080; padding:20px; font-family:monospace; white-space:pre-wrap; font-size:13px;'>JS ERROR: " + msg + "\nLine: " + line + ", Col: " + col + (error && error.stack ? "\n\n" + error.stack : "") + "</div>";
+    }
+  };
+</script>
+
+<script>
+(function(){
+const h = React.createElement;
+const { useState, useEffect, useCallback } = React;
+
+/* ---------- IndexedDB local history store ---------- */
+const DB_NAME = "restorer-db";
+const STORE = "chapters";
+
+function openDB() {
+  return new Promise(function(resolve, reject) {
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = function() {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(STORE)) {
+        const store = db.createObjectStore(STORE, { keyPath: "id" });
+        store.createIndex("createdAt", "createdAt");
+      }
+    };
+    req.onsuccess = function() { resolve(req.result); };
+    req.onerror = function() { reject(req.error); };
+  });
+}
+
+function dbSave(record) {
+  return openDB().then(function(db) {
+    return new Promise(function(resolve, reject) {
+      const tx = db.transaction(STORE, "readwrite");
+      tx.objectStore(STORE).put(record);
+      tx.oncomplete = function() { resolve(record); };
+      tx.onerror = function() { reject(tx.error); };
+    });
+  });
+}
+
+function dbGetAll() {
+  return openDB().then(function(db) {
+    return new Promise(function(resolve, reject) {
+      const tx = db.transaction(STORE, "readonly");
+      const req = tx.objectStore(STORE).getAll();
+      req.onsuccess = function() {
+        resolve(req.result.sort(function(a,b){ return b.createdAt - a.createdAt; }));
+      };
+      req.onerror = function() { reject(req.error); };
+    });
+  });
+}
+
+function dbDelete(id) {
+  return openDB().then(function(db) {
+    return new Promise(function(resolve, reject) {
+      const tx = db.transaction(STORE, "readwrite");
+      tx.objectStore(STORE).delete(id);
+      tx.oncomplete = function() { resolve(); };
+      tx.onerror = function() { reject(tx.error); };
+    });
+  });
+}
+
+/* ---------- Claude API call ---------- */
+function restoreText(rawText) {
+  const systemPrompt = "You are a literary restoration editor. You receive raw machine-translated (MTL) text from Chinese/Korean/Japanese web novels — text that is grammatically broken, awkwardly literal, and stiff. Your job is to rewrite it into fluent, natural, idiomatic English prose, as if a skilled human translator had produced it.\n\nRules:\n- Preserve all plot content, dialogue meaning, character names, and details exactly. Do not omit, summarize, or add events.\n- Fix grammar, sentence structure, and word choice freely for maximum readability and natural flow.\n- Keep character voice and tone (e.g. comedic, dramatic, archaic) consistent with what the raw text implies.\n- Resolve obviously garbled idioms/proverbs into their natural English equivalent meaning, don't translate literally.\n- Output ONLY the restored chapter text. No preamble, no notes, no explanations, no markdown headers.";
+
+  return fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-6",
+      max_tokens: 4096,
+      system: systemPrompt,
+      messages: [{ role: "user", content: rawText }]
+    })
+  }).then(function(response) {
+    if (!response.ok) {
+      throw new Error("Restoration request failed (" + response.status + ")");
+    }
+    return response.json();
+  }).then(function(data) {
+    const text = data.content
+      .map(function(block){ return block.type === "text" ? block.text : ""; })
+      .filter(Boolean)
+      .join("\n");
+    return text.trim();
+  });
+}
+
+/* ---------- Fetch a chapter URL and extract readable text ---------- */
+function cleanExtractedText(text) {
+  const lines = text.split("\n").map(function(l){ return l.trim(); });
+  const paragraphs = lines.filter(function(l){ return l.length > 0; });
+  const cleaned = paragraphs.filter(function(l) {
+    const matches = l.match(/\[.*?\]\(.*?\)/g) || [];
+    const linkRatio = matches.join("").length / Math.max(l.length, 1);
+    return linkRatio < 0.5;
+  });
+  return cleaned.join("\n\n");
+}
+
+function tryJinaReader(url) {
+  return fetch("https://r.jina.ai/" + url, {
+    headers: { "x-engine": "browser", "x-no-cache": "true" }
+  }).then(function(res) {
+    if (!res.ok) throw new Error("jina:" + res.status);
+    return res.text();
+  }).then(cleanExtractedText);
+}
+
+function tryAllOrigins(url) {
+  const api = "https://api.allorigins.win/raw?url=" + encodeURIComponent(url);
+  return fetch(api).then(function(res) {
+    if (!res.ok) throw new Error("allorigins:" + res.status);
+    return res.text();
+  }).then(function(html) {
+    // Strip tags crudely to get readable text from raw HTML
+    const withoutScripts = html.replace(/<script[\s\S]*?<\/script>/gi, " ")
+                                .replace(/<style[\s\S]*?<\/style>/gi, " ");
+    const text = withoutScripts.replace(/<[^>]+>/g, "\n");
+    const decoded = text.replace(/&nbsp;/g, " ").replace(/&amp;/g, "&")
+                         .replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+                         .replace(/&#39;/g, "'").replace(/&quot;/g, '"');
+    const lines = decoded.split("\n").map(function(l){ return l.trim(); }).filter(Boolean);
+    return lines.join("\n\n");
+  });
+}
+
+function fetchChapterFromUrl(url) {
+  return tryJinaReader(url).catch(function(jinaErr) {
+    return tryAllOrigins(url).catch(function(allOriginsErr) {
+      throw new Error("Couldn't reach that page from your browser. Try pasting the chapter text directly instead.");
+    });
+  });
+}
+
+/* ---------- UI Components ---------- */
+
+function Logo() {
+  return h("div", { style: { display:"flex", alignItems:"center", gap:10 } },
+    h("svg", { width:26, height:26, viewBox:"0 0 26 26", fill:"none" },
+      h("path", { d:"M3 21 L13 4 L23 21", stroke:"#C9A876", strokeWidth:"1.6", strokeLinejoin:"round", fill:"none" }),
+      h("path", { d:"M7.5 21 L13 11.5 L18.5 21", stroke:"#8B3A3A", strokeWidth:"1.6", strokeLinejoin:"round", fill:"none", opacity:"0.85" })
+    ),
+    h("span", { style: {
+      fontFamily:"'Source Serif 4', serif", fontWeight:600, fontSize:19,
+      letterSpacing:"0.01em", color:"#F0E6D2"
+    } }, "Restorer")
+  );
+}
+
+function GlyphDivider() {
+  return h("div", { "aria-hidden":"true", style: {
+    display:"flex", alignItems:"center", justifyContent:"center",
+    gap:8, margin:"28px 0", opacity:0.5
+  } },
+    h("div", { style:{ height:1, width:36, background:"linear-gradient(90deg, transparent, #6E5644)" } }),
+    h("span", { style:{ color:"#C9A876", fontSize:11, letterSpacing:"0.15em" } }, "⟡"),
+    h("div", { style:{ height:1, width:36, background:"linear-gradient(90deg, #6E5644, transparent)" } })
+  );
+}
+
+function EmptyState() {
+  return h("div", { style: { textAlign:"center", padding:"60px 24px 40px", animation:"fadeUp 0.5s ease-out" } },
+    h("div", { style: {
+      fontFamily:"'Source Serif 4', serif", fontSize:15, lineHeight:1.7,
+      color:"var(--paper-dim)", maxWidth:380, margin:"0 auto"
+    } }, "Paste a raw machine-translated chapter, or a chapter link, and it will be restored into clean, readable English — your phrasing intact, the meaning untouched.")
+  );
+}
+
+function RawReveal(props) {
+  const raw = props.raw, clean = props.clean;
+  const state = useState(false);
+  const showRaw = state[0], setShowRaw = state[1];
+
+  const toggleBtn = h("button", {
+    onClick: function(){ setShowRaw(!showRaw); },
+    style: {
+      background: showRaw ? "rgba(139,58,58,0.18)" : "transparent",
+      border: "1px solid " + (showRaw ? "#A85C5C" : "#6E5644"),
+      color: showRaw ? "#A85C5C" : "var(--paper-dim)",
+      borderRadius: 20, padding: "6px 14px", fontSize: 12,
+      fontFamily: "'JetBrains Mono', monospace", letterSpacing: "0.04em",
+      cursor: "pointer", display:"flex", alignItems:"center", gap:6
+    }
+  },
+    h("span", { style: {
+      width:6, height:6, borderRadius:"50%",
+      background: showRaw ? "#A85C5C" : "var(--gold)", display:"inline-block"
+    } }),
+    showRaw ? "VIEWING RAW" : "VIEW RAW"
+  );
+
+  const content = showRaw
+    ? h("div", { style: {
+        fontFamily:"'JetBrains Mono', monospace", fontSize: 13.5, lineHeight: 1.85,
+        color: "rgba(168,92,92,0.85)", letterSpacing: "0.01em", whiteSpace: "pre-wrap",
+        animation: "fadeUp 0.3s ease-out", padding: "18px 20px",
+        background: "rgba(139,58,58,0.06)", border: "1px solid rgba(139,58,58,0.25)",
+        borderRadius: 10
+      } }, raw)
+    : h("div", { style: {
+        fontFamily: "'Source Serif 4', serif", fontSize: 18, lineHeight: 1.85,
+        color: "var(--paper)", letterSpacing: "0.005em", animation: "fadeUp 0.3s ease-out"
+      } }, clean.split("\n\n").map(function(p, i) {
+          return h("p", { key:i, style:{ margin: "0 0 1.1em 0" } }, p);
+        })
+      );
+
+  return h("div", null,
+    h("div", { style:{ display:"flex", justifyContent:"flex-end", marginBottom:14 } }, toggleBtn),
+    content
+  );
+}
+
+function RestoringAnimation() {
+  return h("div", { style: { padding:"50px 10px", textAlign:"center" } },
+    h("div", { style: {
+      display:"inline-block", fontFamily:"'JetBrains Mono', monospace", fontSize: 13,
+      color: "var(--gold)", letterSpacing:"0.08em", marginBottom: 18
+    } }, "RESTORING"),
+    h("div", { style: {
+      height: 2, width: 180, margin:"0 auto",
+      background: "linear-gradient(90deg, transparent, var(--gold), transparent)",
+      backgroundSize: "200% 100%", animation: "shimmer 1.4s ease-in-out infinite",
+      borderRadius: 2
+    } }),
+    h("div", { style: { marginTop: 22, fontSize: 13, color: "var(--paper-dim)" } },
+      "Untangling syntax, smoothing phrasing…")
+  );
+}
+
+function InputPanel(props) {
+  const onSubmit = props.onSubmit, busy = props.busy;
+  const modeState = useState("paste");
+  const mode = modeState[0], setMode = modeState[1];
+  const textState = useState("");
+  const text = textState[0], setText = textState[1];
+  const urlState = useState("");
+  const url = urlState[0], setUrl = urlState[1];
+
+  const handleSubmit = function() {
+    if (mode === "paste" && text.trim()) onSubmit({ type: "paste", value: text.trim() });
+    if (mode === "url" && url.trim()) onSubmit({ type: "url", value: url.trim() });
+  };
+
+  const tabs = h("div", { style:{ display:"flex", gap:6, marginBottom:14 } },
+    ["paste","url"].map(function(m) {
+      return h("button", {
+        key: m,
+        onClick: function(){ setMode(m); },
+        style: {
+          flex:1, padding:"9px 0", borderRadius:8,
+          border: "1px solid " + (mode===m ? "var(--gold)" : "transparent"),
+          background: mode===m ? "rgba(201,168,118,0.1)" : "transparent",
+          color: mode===m ? "var(--gold)" : "var(--paper-dim)",
+          fontSize:13, fontWeight:600, letterSpacing:"0.02em", cursor:"pointer"
+        }
+      }, m === "paste" ? "Paste text" : "Chapter link");
+    })
+  );
+
+  const field = mode === "paste"
+    ? h("textarea", {
+        value: text,
+        onChange: function(e){ setText(e.target.value); },
+        placeholder: "Paste the raw MTL chapter here…",
+        rows: 7,
+        style: {
+          width:"100%", background: "var(--ink)", border: "1px solid var(--brown)",
+          borderRadius: 8, color: "var(--paper)", fontFamily: "'JetBrains Mono', monospace",
+          lineHeight: 1.7, padding: 14, resize: "vertical", outline: "none"
+        }
+      })
+    : h("input", {
+        value: url,
+        onChange: function(e){ setUrl(e.target.value); },
+        placeholder: "https://lnmtl.com/chapter/...",
+        style: {
+          width:"100%", background: "var(--ink)", border: "1px solid var(--brown)",
+          borderRadius: 8, color: "var(--paper)", fontFamily: "'JetBrains Mono', monospace",
+          padding: "12px 14px", outline: "none"
+        }
+      });
+
+  const disabled = busy || (mode==="paste" ? !text.trim() : !url.trim());
+
+  const submitBtn = h("button", {
+    onClick: handleSubmit,
+    disabled: disabled,
+    style: {
+      width: "100%", marginTop: 14, padding: "13px 0", borderRadius: 8, border: "none",
+      background: busy ? "var(--brown)" : "var(--gold)",
+      color: busy ? "var(--paper-dim)" : "var(--ink)",
+      fontWeight: 700, fontSize: 14, letterSpacing: "0.02em",
+      cursor: busy ? "default" : "pointer",
+      opacity: disabled ? 0.4 : 1
+    }
+  }, busy ? "Restoring…" : "Restore chapter");
+
+  return h("div", { style: {
+    background: "var(--ink-2)", border: "1px solid var(--brown)",
+    borderRadius: 14, padding: 18, animation: "fadeUp 0.4s ease-out"
+  } }, tabs, field, submitBtn);
+}
+
+function HistoryItem(props) {
+  const item = props.item, onOpen = props.onOpen, onDelete = props.onDelete;
+  const preview = item.cleanText.slice(0, 90);
+  const date = new Date(item.createdAt).toLocaleDateString(undefined, { month:"short", day:"numeric" });
+
+  return h("div", {
+    onClick: function(){ onOpen(item); },
+    style: {
+      padding: "14px 16px", background: "var(--ink-2)", border: "1px solid var(--brown)",
+      borderRadius: 10, marginBottom: 10, cursor: "pointer", position: "relative"
+    }
+  },
+    h("div", { style:{ display:"flex", justifyContent:"space-between", alignItems:"baseline", marginBottom:6 } },
+      h("span", { style:{ fontSize:11, fontFamily:"'JetBrains Mono', monospace", color:"var(--gold)", letterSpacing:"0.05em" } }, date),
+      h("button", {
+        onClick: function(e){ e.stopPropagation(); onDelete(item.id); },
+        style: { background:"none", border:"none", color:"var(--paper-dim)", cursor:"pointer", fontSize:12, padding:4 }
+      }, "✕")
+    ),
+    h("div", { style: {
+      fontFamily:"'Source Serif 4', serif", fontSize:14.5, lineHeight:1.5,
+      color:"var(--paper)", overflow:"hidden", textOverflow:"ellipsis",
+      display:"-webkit-box", WebkitLineClamp:2, WebkitBoxOrient:"vertical"
+    } }, preview + "…")
+  );
+}
+
+function App() {
+  const viewState = useState("home");
+  const view = viewState[0], setView = viewState[1];
+  const currentState = useState(null);
+  const current = currentState[0], setCurrent = currentState[1];
+  const busyState = useState(false);
+  const busy = busyState[0], setBusy = busyState[1];
+  const errorState = useState(null);
+  const error = errorState[0], setError = errorState[1];
+  const historyState = useState([]);
+  const history = historyState[0], setHistory = historyState[1];
+
+  useEffect(function() {
+    dbGetAll().then(setHistory).catch(function(){});
+  }, []);
+
+  const handleSubmit = useCallback(function(input) {
+    setError(null);
+    setBusy(true);
+
+    const rawTextPromise = input.type === "paste"
+      ? Promise.resolve(input.value)
+      : fetchChapterFromUrl(input.value).then(function(rawText) {
+          if (!rawText || rawText.length < 50) {
+            throw new Error("Couldn't extract chapter text from that link. Try pasting the text directly instead.");
+          }
+          return rawText;
+        });
+
+    rawTextPromise.then(function(rawText) {
+      return restoreText(rawText).then(function(cleanText) {
+        const record = {
+          id: "ch_" + Date.now(),
+          rawText: rawText,
+          cleanText: cleanText,
+          sourceUrl: input.type === "url" ? input.value : null,
+          createdAt: Date.now()
+        };
+        return dbSave(record).then(function() {
+          setHistory(function(h){ return [record].concat(h); });
+          setCurrent(record);
+          setView("reading");
+        });
+      });
+    }).catch(function(err) {
+      setError((err && err.message) || "Something went wrong restoring this chapter.");
+    }).finally(function() {
+      setBusy(false);
+    });
+  }, []);
+
+  const openHistoryItem = function(item) {
+    setCurrent(item);
+    setView("reading");
+  };
+
+  const deleteHistoryItem = function(id) {
+    dbDelete(id).then(function() {
+      setHistory(function(h){ return h.filter(function(item){ return item.id !== id; }); });
+    });
+  };
+
+  const header = h("div", {
+    style: {
+      display:"flex", justifyContent:"space-between", alignItems:"center",
+      padding: "22px 0 18px",
+      borderBottom: view === "home" ? "none" : "1px solid var(--brown)",
+      marginBottom: view === "home" ? 0 : 24,
+      position: "sticky", top:0, background:"var(--ink)", zIndex:10
+    }
+  },
+    h("div", { onClick: function(){ setView("home"); }, style:{ cursor:"pointer" } },
+      view !== "home"
+        ? h("span", { style: { fontSize:13, color:"var(--gold)", display:"flex", alignItems:"center", gap:6 } }, "← Back")
+        : h(Logo)
+    ),
+    (view === "home" && history.length > 0)
+      ? h("button", {
+          onClick: function(){ setView("history"); },
+          style: {
+            background:"none", border:"1px solid var(--brown)", borderRadius:20,
+            color:"var(--paper-dim)", fontSize:12, padding:"6px 13px", cursor:"pointer"
+          }
+        }, "History · " + history.length)
+      : null
+  );
+
+  let body = null;
+
+  if (view === "home") {
+    body = h("div", null,
+      h("div", { style: {
+        fontFamily:"'Source Serif 4', serif", fontSize: 26, fontWeight: 600,
+        lineHeight: 1.3, color: "var(--paper)", margin: "8px 0 6px"
+      } },
+        "Turn rough MTL into ",
+        h("span", { style:{ color:"var(--gold)", fontStyle:"italic" } }, "readable"),
+        " prose."
+      ),
+      h("p", { style: { fontSize:14, color:"var(--paper-dim)", lineHeight:1.6, margin: "0 0 26px" } },
+        "Paste a chapter or drop a link. The grammar gets fixed, the voice stays intact, and you can always peek at the original."
+      ),
+      h(InputPanel, { onSubmit: handleSubmit, busy: busy }),
+      error ? h("div", {
+        style: {
+          marginTop: 14, padding: "12px 16px", background: "rgba(139,58,58,0.12)",
+          border:"1px solid #8B3A3A", borderRadius: 8, color: "#A85C5C", fontSize: 13
+        }
+      }, error) : null,
+      (!busy && !current) ? h(EmptyState) : null
+    );
+  } else if (view === "reading" && current) {
+    body = h("div", null,
+      busy ? h(RestoringAnimation) : h(React.Fragment, null,
+        h(RawReveal, { raw: current.rawText, clean: current.cleanText }),
+        h(GlyphDivider),
+        h("div", { style:{ textAlign:"center" } },
+          h("button", {
+            onClick: function(){ setView("home"); },
+            style: {
+              background:"none", border:"1px solid var(--brown)", borderRadius: 20,
+              color:"var(--paper-dim)", padding:"9px 20px", fontSize:13, cursor:"pointer"
+            }
+          }, "Restore another chapter")
+        )
+      )
+    );
+  } else if (view === "history") {
+    body = h("div", null,
+      h("div", { style: { fontFamily:"'Source Serif 4', serif", fontSize:20, fontWeight:600, marginBottom: 18, color:"var(--paper)" } },
+        "Your restored chapters"
+      ),
+      history.length === 0
+        ? h("div", { style:{ color:"var(--paper-dim)", fontSize:14 } }, "Nothing here yet.")
+        : history.map(function(item) {
+            return h(HistoryItem, { key:item.id, item:item, onOpen:openHistoryItem, onDelete:deleteHistoryItem });
+          })
+    );
+  }
+
+  return h("div", { style: { maxWidth: 640, margin: "0 auto", minHeight: "100vh", padding: "0 18px 60px", position: "relative" } },
+    header, body
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(h(App));
+})();
+</script>
+</body>
+</html>
