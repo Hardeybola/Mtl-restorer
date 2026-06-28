@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Test</title>
+</head>
+<body style="background:#1A1612; color:#F0E6D2; font-family:sans-serif; padding:30px;">
+  <div id="root">Loading...</div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.development.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <script type="text/babel">
+    const App = () => <h1>✅ It works! React is rendering.</h1>;
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+
+  <script>
+    window.onerror = function(msg, url, line) {
+      document.getElementById("root").innerHTML =
+        "<p style='color:#ff8080'>JS ERROR: " + msg + " (line " + line + ")</p>";
+    };
+  </script>
+</body>
+</html>
